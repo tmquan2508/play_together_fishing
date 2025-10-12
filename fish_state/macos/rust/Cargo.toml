@@ -1,0 +1,12 @@
+[package]
+name = "fish_tool_macos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memchr = "2.7"
+anyhow = "1.0"
+mach = "0.3"
+sysinfo = "0.30.13"
+libc = "0.2"
+ctrlc = "3.4.4"
