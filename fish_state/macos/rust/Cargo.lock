@@ -89,6 +89,7 @@ dependencies = [
  "libc",
  "mach",
  "memchr",
+ "rayon",
  "sysinfo",
 ]
 

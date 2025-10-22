@@ -18,6 +18,7 @@ use mach::vm_region::VM_REGION_BASIC_INFO_64;
 use mach::vm_statistics::VM_FLAGS_ANYWHERE;
 use mach::vm_types::{mach_vm_address_t, mach_vm_size_t};
 use memchr::memchr;
+use rayon::prelude::*;
 use sysinfo::System;
 
 const TARGET_PROCESS_NAME: &str = "PLAY TOGETHER";
@@ -40,14 +41,12 @@ fn scan_aob(
     signature: &[u8],
     wildcard: u8,
 ) -> Result<Vec<mach_vm_address_t>> {
-    let mut results = Vec::<mach_vm_address_t>::new();
     let sig_len = signature.len();
     if sig_len == 0 {
-        return Ok(results);
+        return Ok(Vec::new());
     }
 
     let mut address: mach_vm_address_t = 0;
-
     let mut regions: Vec<(mach_vm_address_t, mach_vm_size_t)> = Vec::new();
     loop {
         let mut size: mach_vm_size_t = 0;
@@ -55,7 +54,6 @@ fn scan_aob(
         let mut object_name = 0;
         let mut info_size = (size_of::<mach::vm_region::vm_region_basic_info_64>()
             / size_of::<i32>()) as mach_msg_type_number_t;
-
         let kern_ret = unsafe {
             mach::vm::mach_vm_region(
                 task,
@@ -70,7 +68,6 @@ fn scan_aob(
         if kern_ret != KERN_SUCCESS {
             break;
         }
-
         if (info.protection & VM_PROT_READ) != 0 {
             if let Some(last_region) = regions.last_mut() {
                 if last_region.0 + last_region.1 == address {
@@ -85,59 +82,64 @@ fn scan_aob(
         address += size;
     }
 
-    for (region_base, region_size) in regions {
-        let mut remapped_address: mach_vm_address_t = 0;
-        let mut cur_protection = 0;
-        let mut max_protection = 0;
+    let all_results: Vec<Vec<mach_vm_address_t>> = regions
+        .par_iter()
+        .map(|&(region_base, region_size)| {
+            let mut matches_in_region = Vec::new();
+            let mut remapped_address: mach_vm_address_t = 0;
+            let mut cur_protection = 0;
+            let mut max_protection = 0;
 
-        let kern_ret = unsafe {
-            mach_vm_remap(
-                mach::traps::mach_task_self(),
-                &mut remapped_address,
-                region_size,
-                0,
-                VM_FLAGS_ANYWHERE,
-                task,
-                region_base,
-                0,
-                &mut cur_protection,
-                &mut max_protection,
-                VM_INHERIT_NONE,
-            )
-        };
-
-        if kern_ret == KERN_SUCCESS {
-            let data = unsafe {
-                std::slice::from_raw_parts(remapped_address as *const u8, region_size as usize)
+            let kern_ret = unsafe {
+                mach_vm_remap(
+                    mach::traps::mach_task_self(),
+                    &mut remapped_address,
+                    region_size,
+                    0,
+                    VM_FLAGS_ANYWHERE,
+                    task,
+                    region_base,
+                    0,
+                    &mut cur_protection,
+                    &mut max_protection,
+                    VM_INHERIT_NONE,
+                )
             };
 
-            let mut search_offset = 0;
-            while let Some(index) = memchr(signature[0], &data[search_offset..]) {
-                let match_pos = search_offset + index;
-                if match_pos + sig_len > data.len() {
-                    break;
-                }
+            if kern_ret == KERN_SUCCESS {
+                let data = unsafe {
+                    std::slice::from_raw_parts(remapped_address as *const u8, region_size as usize)
+                };
 
-                if matches_with_wildcard(
-                    &data[match_pos..match_pos + sig_len],
-                    signature,
-                    wildcard,
-                ) {
-                    let absolute_addr = region_base + match_pos as u64;
-                    if results.last() != Some(&absolute_addr) {
-                        results.push(absolute_addr);
+                let mut search_offset = 0;
+                while let Some(index) = memchr(signature[0], &data[search_offset..]) {
+                    let match_pos = search_offset + index;
+                    if match_pos + sig_len > data.len() {
+                        break;
                     }
+                    if matches_with_wildcard(
+                        &data[match_pos..match_pos + sig_len],
+                        signature,
+                        wildcard,
+                    ) {
+                        matches_in_region.push(region_base + match_pos as u64);
+                    }
+                    search_offset = match_pos + 1;
                 }
-                search_offset = match_pos + 1;
-            }
 
-            unsafe {
-                mach_vm_deallocate(mach::traps::mach_task_self(), remapped_address, region_size);
+                unsafe {
+                    mach_vm_deallocate(mach::traps::mach_task_self(), remapped_address, region_size);
+                }
             }
-        }
-    }
+            matches_in_region
+        })
+        .collect();
 
-    Ok(results)
+    let mut final_results: Vec<mach_vm_address_t> = all_results.into_iter().flatten().collect();
+    final_results.sort_unstable();
+    final_results.dedup();
+
+    Ok(final_results)
 }
 
 unsafe fn read_memory<T: Copy>(task: mach_port_t, address: mach_vm_address_t) -> Result<T> {
