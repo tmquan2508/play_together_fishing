@@ -4,8 +4,7 @@ import psutil
 import time
 import signal
 import sys
-
-# This python version may take a longer than other language.
+import re
 
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
@@ -78,13 +77,14 @@ def read_i32(handle, address):
         return None
     return int.from_bytes(data, byteorder='little', signed=True)
 
-def matches_with_wildcard(window, signature, wildcard=0x2E):
-    if len(window) != len(signature):
-        return False
-    for a, b in zip(window, signature):
-        if b != wildcard and a != b:
-            return False
-    return True
+def create_aob_pattern(signature, wildcard):
+    pattern = b''
+    for byte in signature:
+        if byte == wildcard:
+            pattern += b'.'
+        else:
+            pattern += re.escape(bytes([byte]))
+    return pattern
 
 def scan_aob(handle, signature, wildcard=0x2E, chunk_size=4 * 1024 * 1024):
     results = []
@@ -93,8 +93,11 @@ def scan_aob(handle, signature, wildcard=0x2E, chunk_size=4 * 1024 * 1024):
         return results
     overlap_len = sig_len - 1
 
+    aob_pattern = re.compile(create_aob_pattern(signature, wildcard), re.DOTALL)
+
     addr = 0
     mbi = MEMORY_BASIC_INFORMATION()
+    overlap_buffer = b""
 
     while True:
         result = kernel32.VirtualQueryEx(
@@ -109,58 +112,38 @@ def scan_aob(handle, signature, wildcard=0x2E, chunk_size=4 * 1024 * 1024):
         region_base = int(mbi.BaseAddress or 0)
         region_size = int(mbi.RegionSize or 0)
 
-        if region_size == 0:
-            addr = region_base + 1
-            continue
-
-        if mbi.State == MEM_COMMIT and is_readable(mbi.Protect):
-            region_offset = 0
-            overlap_buffer = b""
-
-            while region_offset < region_size:
-                bytes_to_read = min(region_size - region_offset, chunk_size)
-                full_addr = region_base + region_offset
-
-                raw_data = read_process_memory(handle, full_addr, bytes_to_read)
-                if raw_data is None:
-                    region_offset += bytes_to_read
-                    continue
-
-                scan_data = overlap_buffer + raw_data
-
-                search_start = 0
-                while search_start <= len(scan_data) - sig_len:
-                    first_byte = signature[0]
-                    try:
-                        idx = scan_data.index(first_byte, search_start)
-                    except ValueError:
-                        break
-
-                    if idx + sig_len > len(scan_data):
-                        break
-
-                    window = scan_data[idx:idx + sig_len]
-                    if matches_with_wildcard(window, signature, wildcard):
-                        absolute_addr = full_addr + idx - len(overlap_buffer)
-                        if not results or results[-1] != absolute_addr:
-                            results.append(absolute_addr)
-                        search_start = idx + 1
-                    else:
-                        search_start = idx + 1
-
-                if bytes_to_read >= overlap_len:
-                    overlap_buffer = raw_data[-overlap_len:]
-                else:
-                    overlap_buffer = raw_data
-
-                region_offset += bytes_to_read
-
         next_addr = region_base + region_size
         if next_addr <= addr:
             addr += 1
         else:
             addr = next_addr
 
+        if mbi.State == MEM_COMMIT and is_readable(mbi.Protect):
+            region_offset = 0
+            while region_offset < region_size:
+                bytes_to_read = min(region_size - region_offset, chunk_size)
+                
+                raw_data = read_process_memory(handle, region_base + region_offset, bytes_to_read)
+                if raw_data is None:
+                    region_offset += bytes_to_read
+                    continue
+                
+                scan_data = overlap_buffer + raw_data
+
+                for match in aob_pattern.finditer(scan_data):
+                    match_start_index = match.start()
+                    absolute_addr = region_base + region_offset + match_start_index - len(overlap_buffer)
+                    
+                    if not results or results[-1] != absolute_addr:
+                        results.append(absolute_addr)
+
+                if bytes_to_read >= overlap_len:
+                    overlap_buffer = raw_data[-overlap_len:]
+                else:
+                    overlap_buffer = raw_data
+                
+                region_offset += bytes_to_read
+    
     return results
 
 TARGET_PROCESS_NAME = "vmmem"
@@ -190,7 +173,6 @@ def main():
     time.sleep(5)
 
     print("🔍 Scanning AOB...")
-    print("This may take 1-2 mins, wait patiently")
     start = time.time()
     base_addrs = scan_aob(handle, AOB_SIGNATURE, WILDCARD)
     elapsed = time.time() - start
