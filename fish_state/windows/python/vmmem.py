@@ -32,10 +32,7 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
     ]
 
 def is_readable(protect):
-    readable_flags = (
-        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
-    )
+    readable_flags = (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
     return (protect & readable_flags) != 0 and (protect & PAGE_GUARD == 0)
 
 def find_process_pid_by_name(name):
@@ -45,11 +42,7 @@ def find_process_pid_by_name(name):
     return None
 
 def open_process_readonly(pid):
-    handle = kernel32.OpenProcess(
-        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-        False,
-        pid
-    )
+    handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not handle:
         raise OSError(f"OpenProcess failed for PID {pid}. Error: {kernel32.GetLastError()}")
     return handle
@@ -57,19 +50,32 @@ def open_process_readonly(pid):
 def close_handle(handle):
     kernel32.CloseHandle(handle)
 
-def read_process_memory(handle, address, size):
-    buffer = (ctypes.c_byte * size)()
-    bytes_read = ctypes.c_size_t(0)
-    success = kernel32.ReadProcessMemory(
-        handle,
-        ctypes.c_void_p(address),
-        buffer,
-        size,
-        ctypes.byref(bytes_read)
-    )
-    if not success or bytes_read.value != size:
-        return None
-    return bytearray(buffer)
+def read_process_memory(handle, address, size_or_buffer):
+    if isinstance(size_or_buffer, int):
+        size = size_or_buffer
+        buffer = (ctypes.c_byte * size)()
+        bytes_read = ctypes.c_size_t(0)
+        
+        success = kernel32.ReadProcessMemory(
+            handle, ctypes.c_void_p(address), buffer, size, ctypes.byref(bytes_read)
+        )
+        
+        if not success or bytes_read.value != size:
+            return None
+        return bytearray(buffer)
+    else:
+        buffer = size_or_buffer
+        bytes_read = ctypes.c_size_t(0)
+        buffer_size = len(buffer)
+        c_buffer = (ctypes.c_char * buffer_size).from_buffer(buffer)
+        
+        success = kernel32.ReadProcessMemory(
+            handle, ctypes.c_void_p(address), c_buffer, buffer_size, ctypes.byref(bytes_read)
+        )
+        
+        if not success:
+            return 0
+        return bytes_read.value
 
 def read_i32(handle, address):
     data = read_process_memory(handle, address, 4)
@@ -97,21 +103,20 @@ def scan_aob(handle, signature, wildcard=0x2E, chunk_size=4 * 1024 * 1024):
 
     addr = 0
     mbi = MEMORY_BASIC_INFORMATION()
-    overlap_buffer = b""
+
+    scan_buffer = bytearray(chunk_size + overlap_len)
+    overlap_view = memoryview(scan_buffer)[:overlap_len]
+    read_view = memoryview(scan_buffer)[overlap_len:]
+    last_chunk_tail = bytearray(overlap_len)
 
     while True:
-        result = kernel32.VirtualQueryEx(
-            handle,
-            ctypes.c_void_p(addr),
-            ctypes.byref(mbi),
-            ctypes.sizeof(mbi)
-        )
+        result = kernel32.VirtualQueryEx(handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
         if not result:
             break
 
         region_base = int(mbi.BaseAddress or 0)
         region_size = int(mbi.RegionSize or 0)
-
+        
         next_addr = region_base + region_size
         if next_addr <= addr:
             addr += 1
@@ -119,37 +124,44 @@ def scan_aob(handle, signature, wildcard=0x2E, chunk_size=4 * 1024 * 1024):
             addr = next_addr
 
         if mbi.State == MEM_COMMIT and is_readable(mbi.Protect):
+            overlap_view[:] = last_chunk_tail
+            
             region_offset = 0
             while region_offset < region_size:
                 bytes_to_read = min(region_size - region_offset, chunk_size)
+                current_read_view = read_view[:bytes_to_read]
                 
-                raw_data = read_process_memory(handle, region_base + region_offset, bytes_to_read)
-                if raw_data is None:
+                bytes_read = read_process_memory(handle, region_base + region_offset, current_read_view)
+                
+                if bytes_read == 0:
                     region_offset += bytes_to_read
                     continue
                 
-                scan_data = overlap_buffer + raw_data
+                effective_scan_view = memoryview(scan_buffer)[:overlap_len + bytes_read]
 
-                for match in aob_pattern.finditer(scan_data):
+                for match in aob_pattern.finditer(effective_scan_view):
                     match_start_index = match.start()
-                    absolute_addr = region_base + region_offset + match_start_index - len(overlap_buffer)
-                    
+                    absolute_addr = region_base + region_offset + match_start_index - overlap_len
                     if not results or results[-1] != absolute_addr:
                         results.append(absolute_addr)
-
-                if bytes_to_read >= overlap_len:
-                    overlap_buffer = raw_data[-overlap_len:]
-                else:
-                    overlap_buffer = raw_data
                 
-                region_offset += bytes_to_read
-    
+                if bytes_read >= overlap_len:
+                    if overlap_len > 0:
+                        last_chunk_tail[:] = effective_scan_view[-overlap_len:]
+                else:
+                    start_copy = overlap_len - bytes_read
+                    last_chunk_tail[start_copy:] = effective_scan_view[:bytes_read]
+
+                overlap_view[:] = last_chunk_tail
+                region_offset += bytes_read
+            
+            last_chunk_tail = bytearray(overlap_len)
+
     return results
 
 TARGET_PROCESS_NAME = "vmmem"
 AOB_SIGNATURE = b"\x20\x41\xCD\xCC\x4C\x3E\x2E\x2E\x2E\x2E\x2E\x2E\x00\x00"
 WILDCARD = 0x2E
-
 BALO_OFFSET = 214
 CONFIRM_VALUE = 300
 FISH_STATE_OFFSET = 308
