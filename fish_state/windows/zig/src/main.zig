@@ -70,7 +70,7 @@ fn getProcessIdByName(name: []const u8) !u32 {
     return error.ProcessNotFound;
 }
 
-fn scanAob(allocator: std.mem.Allocator, h_proc: HANDLE) !std.ArrayListUnmanaged(usize) {
+fn scanAobOptimized(allocator: std.mem.Allocator, h_proc: HANDLE) !std.ArrayListUnmanaged(usize) {
     var matches = std.ArrayListUnmanaged(usize){};
     const sig_len = AOB_SIGNATURE.len;
     const overlap_len = sig_len - 1;
@@ -81,6 +81,7 @@ fn scanAob(allocator: std.mem.Allocator, h_proc: HANDLE) !std.ArrayListUnmanaged
     @memset(scan_buf, 0);
     var addr: usize = 0;
     var mem_info: MEMORY_BASIC_INFORMATION = undefined;
+
     while (VirtualQueryEx(h_proc, @ptrFromInt(addr), &mem_info, @sizeOf(MEMORY_BASIC_INFORMATION)) != 0) {
         if (mem_info.State == 0x1000 and (mem_info.Protect & 0x66) != 0) {
             var region_offset: usize = 0;
@@ -90,22 +91,37 @@ fn scanAob(allocator: std.mem.Allocator, h_proc: HANDLE) !std.ArrayListUnmanaged
                 if (ReadProcessMemory(h_proc, @ptrFromInt(@intFromPtr(mem_info.BaseAddress) + region_offset), chunk_buf.ptr, to_read, &bytes_read) != FALSE) {
                     @memcpy(scan_buf[0..overlap_len], scan_buf[CHUNK_SIZE..][0..overlap_len]);
                     @memcpy(scan_buf[overlap_len..][0..bytes_read], chunk_buf[0..bytes_read]);
-                    const area = scan_buf[0 .. overlap_len + bytes_read];
+                    
+                    const total_valid = overlap_len + bytes_read;
+                    const area = scan_buf[0..total_valid];
                     var i: usize = 0;
-                    while (i <= area.len - sig_len) {
-                        if (area[i] == AOB_SIGNATURE[0]) {
+                    
+                    while (i <= total_valid - sig_len) {
+                        const found_offset = std.mem.indexOfScalar(u8, area[i..], AOB_SIGNATURE[0]);
+                        if (found_offset) |offset| {
+                            const found_idx = i + offset;
+                            if (found_idx > total_valid - sig_len) break;
+
                             var match = true;
                             inline for (1..sig_len) |j| {
-                                if (AOB_SIGNATURE[j] != AOB_WILDCARD and AOB_SIGNATURE[j] != area[i + j]) {
+                                if (AOB_SIGNATURE[j] != AOB_WILDCARD and AOB_SIGNATURE[j] != area[found_idx + j]) {
                                     match = false;
                                     break;
                                 }
                             }
-                            if (match) try matches.append(allocator, @intFromPtr(mem_info.BaseAddress) + region_offset - overlap_len + i);
+
+                            if (match) {
+                                try matches.append(allocator, @intFromPtr(mem_info.BaseAddress) + region_offset - overlap_len + found_idx);
+                            }
+                            i = found_idx + 1;
+                        } else {
+                            break;
                         }
-                        i += 1;
                     }
-                    if (bytes_read >= overlap_len) @memcpy(scan_buf[CHUNK_SIZE..][0..overlap_len], chunk_buf[bytes_read - overlap_len .. bytes_read]);
+
+                    if (bytes_read >= overlap_len) {
+                        @memcpy(scan_buf[CHUNK_SIZE..][0..overlap_len], chunk_buf[bytes_read - overlap_len .. bytes_read]);
+                    }
                 }
                 region_offset += to_read;
             }
@@ -145,7 +161,7 @@ pub fn main() !void {
     _ = QueryPerformanceFrequency(&freq);
     _ = QueryPerformanceCounter(&start_t);
 
-    var matches = try scanAob(allocator, h_proc);
+    var matches = try scanAobOptimized(allocator, h_proc);
     defer matches.deinit(allocator);
     
     _ = QueryPerformanceCounter(&end_t);
